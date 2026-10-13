@@ -1,0 +1,80 @@
+import type { Battery, Customer, NewMovement, Sale, SaleLine, SaleVoid, StockMovement } from './types.ts';
+
+export class InsufficientStockError extends Error {
+  constructor(public batteryId: string, public available: number, public requested: number) {
+    super(`insufficient stock for ${batteryId}: have ${available}, need ${requested}`);
+  }
+}
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+export function saleTotal(lines: Pick<SaleLine, 'qty' | 'unitPrice'>[], discount: number): number {
+  return round2(lines.reduce((s, l) => s + l.qty * l.unitPrice, 0) - discount);
+}
+
+export function quantityFromMovements(movements: Pick<StockMovement, 'delta'>[]): number {
+  return movements.reduce((s, m) => s + m.delta, 0);
+}
+
+/** Same rules as sale.schema.json: names, ID (9 or 11 digits) or Georgian IBAN, at least one of the two. */
+export function checkCustomer(c: Customer): string[] {
+  const errors: string[] = [];
+  if (!c.firstName?.trim()) errors.push('customer first name is required');
+  if (!c.lastName?.trim()) errors.push('customer last name is required');
+  if (!c.idNumber && !c.iban) errors.push('customer needs an ID number or an IBAN');
+  if (c.idNumber && !/^(\d{9}|\d{11})$/.test(c.idNumber)) errors.push('ID number must be 9 or 11 digits');
+  if (c.iban && !/^GE\d{2}[A-Z]{2}\d{16}$/.test(c.iban)) errors.push('IBAN must look like GE00XX0000000000000000');
+  return errors;
+}
+
+/** Problems with a sale that is about to be recorded; empty = OK. Lines for the same battery are summed. */
+export function checkSale(sale: { lines: SaleLine[]; discount: number }, batteries: Battery[]): string[] {
+  const errors: string[] = [];
+  if (!sale.lines.length) errors.push('sale has no lines');
+  const byId = new Map(batteries.map((b) => [b.id, b]));
+  const wanted = new Map<string, number>();
+  for (const l of sale.lines) {
+    if (!Number.isInteger(l.qty) || l.qty < 1) errors.push(`${l.batteryId}: qty must be a positive integer`);
+    if (!(l.unitPrice >= 0)) errors.push(`${l.batteryId}: unitPrice must be >= 0`);
+    wanted.set(l.batteryId, (wanted.get(l.batteryId) ?? 0) + l.qty);
+  }
+  for (const [id, qty] of wanted) {
+    const b = byId.get(id);
+    if (!b) errors.push(`${id}: unknown battery`);
+    else if (b.quantity === undefined) errors.push(`${id}: stock quantity is unknown — set it before selling`);
+    else if (b.quantity < qty) errors.push(`${id}: only ${b.quantity} in stock, ${qty} requested`);
+  }
+  if (!(sale.discount >= 0)) errors.push('discount must be >= 0');
+  else if (!errors.length && saleTotal(sale.lines, sale.discount) < 0) errors.push('discount exceeds the sale amount');
+  return errors;
+}
+
+export function movementsForSale(sale: Sale): NewMovement[] {
+  return sale.lines.map((l) => ({ at: sale.soldAt, batteryId: l.batteryId, delta: -l.qty, kind: 'sale', saleId: sale.id, unitCost: l.unitCost ?? null }));
+}
+
+export function movementsForVoid(sale: Sale, v: SaleVoid): NewMovement[] {
+  return sale.lines.map((l) => ({ at: v.at, batteryId: l.batteryId, delta: l.qty, kind: 'sale-void', saleId: sale.id, note: v.reason }));
+}
+
+/** New battery state after movements. Throws InsufficientStockError rather than going below zero.
+ *  Keeps `stock` consistent: 0 → 'out'; positive after 'out' → 'in'; 'order' is a manual state and is left alone. */
+export function applyMovements(battery: Battery, movements: Pick<NewMovement, 'batteryId' | 'delta'>[]): Battery {
+  const mine = movements.filter((m) => m.batteryId === battery.id);
+  const delta = quantityFromMovements(mine);
+  const before = battery.quantity ?? 0;
+  const quantity = before + delta;
+  if (quantity < 0) throw new InsufficientStockError(battery.id, before, -delta);
+  let stock = battery.stock;
+  if (quantity === 0 && stock === 'in') stock = 'out';
+  else if (quantity > 0 && stock === 'out') stock = 'in';
+  return { ...battery, quantity, stock };
+}
+
+/** Keep `stock` consistent with a known quantity: 0 → 'out', positive after 'out' → 'in'. 'order' is a manual state and is left alone. */
+export function normaliseStock<T extends { quantity?: number; stock: Battery['stock'] }>(b: T): T {
+  if (b.quantity === undefined) return b;
+  if (b.quantity === 0 && b.stock === 'in') return { ...b, stock: 'out' };
+  if (b.quantity > 0 && b.stock === 'out') return { ...b, stock: 'in' };
+  return b;
+}
